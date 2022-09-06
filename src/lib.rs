@@ -3,7 +3,7 @@ use std::{
     marker::PhantomData,
     os::unix::prelude::OsStrExt,
     path::Path,
-    str::Utf8Error,
+    str::{FromStr, Utf8Error},
     sync::atomic::{self, AtomicBool},
 };
 
@@ -21,6 +21,8 @@ pub enum Error {
     NullError(#[from] NulError),
     #[error("Proxy is not a valid String")]
     InvalidProxy(#[from] Utf8Error),
+    #[error("Malformed Proxy Entry")]
+    MalformedProxyEntry(String),
 }
 
 static IS_INIT: AtomicBool = AtomicBool::new(false);
@@ -110,9 +112,75 @@ impl<'ctx> PacFile<'ctx> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProxyType {
+    Proxy,
+    Socks,
+    Http,
+    Https,
+    Socks4,
+    Socks5,
+}
+
+impl FromStr for ProxyType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "PROXY" => Ok(Self::Proxy),
+            "SOCKS" => Ok(Self::Socks),
+            "HTTP" => Ok(Self::Http),
+            "HTTPS" => Ok(Self::Https),
+            "SOCKS4" => Ok(Self::Socks4),
+            "SOCKS5" => Ok(Self::Socks5),
+            _ => Err(Error::MalformedProxyEntry(format!("Unknown type `{}`", s))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ProxyEntry {
+    Direct,
+    Proxied {
+        ty: ProxyType,
+        host: String,
+        port: String,
+    },
+}
+
+pub fn decode_proxy(proxy: &str) -> Result<Vec<ProxyEntry>, Error> {
+    proxy
+        .split(';')
+        .map(|part| {
+            let part = part.trim();
+            if let Some(x) = part.strip_prefix("DIRECT") {
+                assert!(x.trim().is_empty(), "DIRECT with host is not supported");
+                Ok(ProxyEntry::Direct)
+            } else {
+                let types = &["PROXY", "SOCKS", "HTTP", "HTTPS", "SOCKS4", "SOCKS5"];
+                for ty in types {
+                    if let Some(proxy) = part.strip_prefix(ty) {
+                        let proxy = proxy.trim();
+                        let colon = proxy.find(':').ok_or_else(|| {
+                            Error::MalformedProxyEntry("No colon in entry".into())
+                        })?;
+                        let (host, port) = proxy.trim().split_at(colon);
+                        return Ok(ProxyEntry::Proxied {
+                            ty: ty.parse()?,
+                            host: host.into(),
+                            port: port[1..].into(),
+                        });
+                    }
+                }
+                Err(Error::MalformedProxyEntry("No type matched".into()))
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
-    use crate::PacParser;
+    use crate::{decode_proxy, PacParser, ProxyEntry, ProxyType};
     use serial_test::serial;
     use url::Url;
 
@@ -124,6 +192,26 @@ mod test {
     }
 
     PAC_FILE! {"pacparser-sys/src/pacparser/tests/proxy.pac"}
+
+    #[test]
+    fn proxy_entry() {
+        assert_eq!(
+            decode_proxy("PROXY 165.225.77.222:80; PROXY 165.225.204.40:80; DIRECT").unwrap(),
+            vec![
+                ProxyEntry::Proxied {
+                    ty: ProxyType::Proxy,
+                    host: "165.225.77.222".into(),
+                    port: "80".into(),
+                },
+                ProxyEntry::Proxied {
+                    ty: ProxyType::Proxy,
+                    host: "165.225.204.40".into(),
+                    port: "80".into(),
+                },
+                ProxyEntry::Direct,
+            ]
+        )
+    }
 
     #[test]
     #[serial]
