@@ -16,14 +16,9 @@ fn main() {
     let args = Args::from_args();
 
     let mut pac_lib = pacparser::PacParser::new().unwrap();
-    let mut pac = pac_lib.load_path(args.file).unwrap();
+    let mut pac = pac_lib
+        .load(std::fs::read_to_string(args.file).unwrap())
+        .unwrap();
 
-    let host = args
-        .host
-        .unwrap_or_else(|| args.url.host_str().unwrap().to_string());
-
-    println!(
-        "{:#?}",
-        pacparser::decode_proxy(pac.find_proxy(args.url.as_str(), &host).unwrap()).unwrap()
-    );
+    println!("{:#?}", pac.find_proxy(&args.url).unwrap());
 }

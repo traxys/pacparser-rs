@@ -1,116 +1,49 @@
-use std::{
-    ffi::{c_void, CStr, CString, NulError},
-    marker::PhantomData,
-    os::unix::prelude::OsStrExt,
-    path::Path,
-    str::{FromStr, Utf8Error},
-    sync::atomic::{self, AtomicBool},
-};
+use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
 
-pub struct PacParser {
-    __private: PhantomData<*const c_void>,
+use boa_engine::{object::FunctionBuilder, property::Attribute, Context, JsResult, JsValue};
+use gc::{Finalize, Trace};
+use ipnet::Ipv4Net;
+use local_ip_address::local_ip;
+use regex::Regex;
+use url::Url;
+
+trait JsResultExt<T> {
+    fn to_string(self, ctx: &mut Context) -> std::result::Result<T, Error>;
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("Pac Parser returned an error")]
-    PacParse,
-    #[error("The library is already in use")]
-    InUse,
-    #[error("The supplied string contains a NULL byte")]
-    NullError(#[from] NulError),
-    #[error("Proxy is not a valid String")]
-    InvalidProxy(#[from] Utf8Error),
-    #[error("Malformed Proxy Entry")]
-    MalformedProxyEntry(String),
-}
-
-static IS_INIT: AtomicBool = AtomicBool::new(false);
-
-impl PacParser {
-    pub fn new() -> Result<Self, Error> {
-        if IS_INIT
-            .compare_exchange(
-                false,
-                true,
-                atomic::Ordering::Acquire,
-                atomic::Ordering::Acquire,
+impl<T> JsResultExt<T> for JsResult<T> {
+    fn to_string(self, ctx: &mut Context) -> std::result::Result<T, Error> {
+        self.map_err(|err| {
+            Error::JsError(
+                err.to_string(ctx)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| "could not format error".into()),
             )
-            .is_err()
-        {
-            return Err(Error::InUse);
-        }
-
-        unsafe {
-            if pacparser_sys::pacparser_init() == 0 {
-                return Err(Error::PacParse);
-            };
-        }
-        Ok(Self {
-            __private: PhantomData,
         })
     }
-
-    pub fn load_string(&mut self, s: &str) -> Result<PacFile<'_>, Error> {
-        let c_str = CString::new(s)?;
-        unsafe {
-            match pacparser_sys::pacparser_parse_pac_string(c_str.as_ptr()) {
-                0 => Err(Error::PacParse),
-                _ => Ok(PacFile { ctx: self }),
-            }
-        }
-    }
-
-    pub fn load_path<P: AsRef<Path>>(&mut self, path: P) -> Result<PacFile, Error> {
-        let p = CString::new(path.as_ref().as_os_str().as_bytes())?;
-        unsafe {
-            match pacparser_sys::pacparser_parse_pac_file(p.as_ptr()) {
-                0 => Err(Error::PacParse),
-                _ => Ok(PacFile { ctx: self }),
-            }
-        }
-    }
-
-    pub fn set_ip(&mut self, ip: &str) -> Result<(), Error> {
-        let s = CString::new(ip)?;
-        unsafe {
-            match pacparser_sys::pacparser_setmyip(s.as_ptr()) {
-                0 => Err(Error::PacParse),
-                _ => Ok(()),
-            }
-        }
-    }
 }
 
-impl Drop for PacParser {
-    fn drop(&mut self) {
-        IS_INIT.store(false, atomic::Ordering::Release);
-        unsafe { pacparser_sys::pacparser_cleanup() }
-    }
+pub struct PacParser {
+    js_ctx: Context,
 }
 
 pub struct PacFile<'ctx> {
     ctx: &'ctx mut PacParser,
 }
 
-impl<'ctx> PacFile<'ctx> {
-    pub fn set_ip(&mut self, ip: &str) -> Result<(), Error> {
-        self.ctx.set_ip(ip)
-    }
-
-    pub fn find_proxy(&mut self, url: &str, host: &str) -> Result<&str, Error> {
-        let url = CString::new(url)?;
-        let host = CString::new(host)?;
-
-        let proxy = unsafe { pacparser_sys::pacparser_find_proxy(url.as_ptr(), host.as_ptr()) };
-
-        if proxy.is_null() {
-            Err(Error::PacParse)
-        } else {
-            unsafe { Ok(CStr::from_ptr(proxy).to_str()?) }
-        }
-    }
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("js error: {0}")]
+    JsError(String),
+    #[error("Proxy entry was invalid: {0}")]
+    MalformedProxyEntry(String),
+    #[error("Pac file did not return a String")]
+    InvalidPacReturn,
+    #[error("Url has no host")]
+    NoHost,
 }
+
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProxyType {
@@ -120,6 +53,16 @@ pub enum ProxyType {
     Https,
     Socks4,
     Socks5,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ProxyEntry {
+    Direct,
+    Proxied {
+        ty: ProxyType,
+        host: String,
+        port: String,
+    },
 }
 
 impl FromStr for ProxyType {
@@ -138,162 +81,379 @@ impl FromStr for ProxyType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ProxyEntry {
-    Direct,
-    Proxied {
-        ty: ProxyType,
-        host: String,
-        port: String,
-    },
+fn dns_domain_is(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    match args {
+        [a, b] => {
+            let (a, b) = (a.to_string(ctx)?, b.to_string(ctx)?);
+
+            Ok(a.ends_with(&*b).into())
+        }
+        _ => unreachable!("expected two arguments"),
+    }
 }
 
-pub fn decode_proxy(proxy: &str) -> Result<Vec<ProxyEntry>, Error> {
-    proxy
-        .split(';')
-        .map(|part| {
-            let part = part.trim();
-            if let Some(x) = part.strip_prefix("DIRECT") {
-                assert!(x.trim().is_empty(), "DIRECT with host is not supported");
-                Ok(ProxyEntry::Direct)
-            } else {
-                let types = &["PROXY", "SOCKS", "HTTP", "HTTPS", "SOCKS4", "SOCKS5"];
-                for ty in types {
-                    if let Some(proxy) = part.strip_prefix(ty) {
-                        let proxy = proxy.trim();
-                        let colon = proxy.find(':').ok_or_else(|| {
-                            Error::MalformedProxyEntry("No colon in entry".into())
-                        })?;
-                        let (host, port) = proxy.trim().split_at(colon);
-                        return Ok(ProxyEntry::Proxied {
-                            ty: ty.parse()?,
-                            host: host.into(),
-                            port: port[1..].into(),
-                        });
-                    }
-                }
-                Err(Error::MalformedProxyEntry("No type matched".into()))
+fn is_plain_hostname(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    match args {
+        [name] => {
+            let n = name.to_string(ctx)?;
+            Ok(match Url::parse(&n) {
+                Err(url::ParseError::RelativeUrlWithoutBase) => !n.contains('.'),
+                Err(_) => false,
+                Ok(v) => v.host_str().map(|n| !n.contains('.')).unwrap_or(false),
             }
-        })
-        .collect()
+            .into())
+        }
+        _ => unreachable!("expected one arguments"),
+    }
+}
+
+fn is_in_inet(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    match args {
+        [host, net, mask] => {
+            let net: Ipv4Addr = net
+                .to_string(ctx)?
+                .parse()
+                .map_err(|err| format!("invalid ip addr: {err:?}"))?;
+
+            let mask: Ipv4Addr = mask
+                .to_string(ctx)?
+                .parse()
+                .map_err(|err| format!("invalid ip mask: {err:?}"))?;
+            let prefix_len = u32::from_ne_bytes(mask.octets()).count_ones();
+
+            let net = Ipv4Net::new(net, prefix_len as u8).expect("prefix should not be a problem");
+
+            match host.to_string(ctx)?.parse() {
+                Err(_) => {
+                    let ip = dns_resolve(host, &[host.clone()], ctx)?
+                        .to_string(ctx)?
+                        .parse()
+                        .expect("dns resolve should return an ip");
+
+                    Ok(net.contains::<&Ipv4Addr>(&ip).into())
+                }
+                Ok(ip) => Ok(net.contains::<&Ipv4Addr>(&ip).into()),
+            }
+        }
+        _ => unreachable!("expected three arguments"),
+    }
+}
+
+fn dns_resolve(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    match args {
+        [name] => {
+            let lookup = dns_lookup::lookup_host(&name.to_string(ctx)?)
+                .map_err(|err| format!("dns error: {err:?}"))?;
+
+            let v4 = lookup.iter().find(|ip| ip.is_ipv4());
+
+            match v4 {
+                None => todo!("handle ipv6"),
+                Some(v4) => Ok(v4.to_string().into()),
+            }
+        }
+        _ => unreachable!("expected one argument"),
+    }
+}
+
+fn my_ip(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let my_ip = local_ip().map_err(|err| format!("Could not get IP addr: {err:?}"))?;
+
+    Ok(my_ip.to_string().into())
+}
+
+fn local_host_or_domain_is(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    match args {
+        [a, b] => {
+            let (a, b) = (a.to_string(ctx)?, b.to_string(ctx)?);
+
+            Ok(b.starts_with(&*a).into())
+        }
+        _ => unreachable!("expected two arguments"),
+    }
+}
+
+#[derive(Trace, Finalize, Debug)]
+struct RegexCache {
+    #[unsafe_ignore_trace]
+    cache: HashMap<String, Regex>,
+}
+
+impl RegexCache {
+    fn matches(&mut self, str: &str, regex: &str) -> JsResult<bool> {
+        match self.cache.get(regex) {
+            None => {
+                let re = Regex::new(&format!("^{regex}$"))
+                    .map_err(|err| format!("regex error: {err:?}"))?;
+                let is_match = re.is_match(str);
+                self.cache.insert(regex.into(), re);
+                Ok(is_match)
+            }
+            Some(re) => Ok(re.is_match(str)),
+        }
+    }
+}
+
+impl PacParser {
+    pub fn new() -> Result<Self> {
+        let mut js_ctx = Context::builder().build();
+
+        js_ctx.register_global_builtin_function("dnsDomainIs", 2, dns_domain_is);
+        js_ctx.register_global_builtin_function("isPlainHostName", 1, is_plain_hostname);
+        js_ctx.register_global_builtin_function("isInNet", 3, is_in_inet);
+        js_ctx.register_global_builtin_function("dnsResolve", 1, dns_resolve);
+        js_ctx.register_global_builtin_function("myIpAddress", 0, my_ip);
+        js_ctx.register_global_builtin_function("localHostOrDomainIs", 2, local_host_or_domain_is);
+
+        let cache = RegexCache {
+            cache: HashMap::new(),
+        };
+
+        let sh_exp = FunctionBuilder::closure_with_captures(
+            &mut js_ctx,
+            |_, args, cache, ctx| match args {
+                [str, regex] => cache
+                    .matches(&*str.to_string(ctx)?, &*regex.to_string(ctx)?)
+                    .map(Into::into),
+                _ => unreachable!("takes two arguments"),
+            },
+            cache,
+        )
+        .length(2)
+        .name("shExpMatch")
+        .build();
+        js_ctx.register_global_property("shExpMatch", sh_exp, Attribute::all());
+
+        Ok(Self { js_ctx })
+    }
+
+    pub fn load<D: AsRef<str>>(&mut self, file: D) -> Result<PacFile> {
+        self.js_ctx
+            .eval(&format!(
+                "function pac(__url, __host) {{ {}; return FindProxyForURL(__url, __host); }}",
+                file.as_ref()
+            ))
+            .to_string(&mut self.js_ctx)?;
+
+        Ok(PacFile { ctx: self })
+    }
+}
+
+impl<'ctx> PacFile<'ctx> {
+    pub fn find_proxy(&mut self, url: &Url) -> Result<Vec<ProxyEntry>> {
+        let host = url.host_str().ok_or(Error::NoHost)?;
+
+        let pac = self
+            .ctx
+            .js_ctx
+            .global_object()
+            .clone()
+            .get("pac", &mut self.ctx.js_ctx)
+            .to_string(&mut self.ctx.js_ctx)?;
+
+        let result = pac
+            .as_callable()
+            .expect("pac should be callable")
+            .call(
+                &pac,
+                &[url.as_str().into(), host.into()],
+                &mut self.ctx.js_ctx,
+            )
+            .to_string(&mut self.ctx.js_ctx)?;
+
+        let result = result.as_string().ok_or(Error::InvalidPacReturn)?;
+
+        result
+            .split(';')
+            .map(|part| {
+                let part = part.trim();
+                if let Some(x) = part.strip_prefix("DIRECT") {
+                    assert!(x.trim().is_empty(), "DIRECT with host is not supported");
+                    Ok(ProxyEntry::Direct)
+                } else {
+                    let types = &["PROXY", "SOCKS", "HTTP", "HTTPS", "SOCKS4", "SOCKS5"];
+                    for ty in types {
+                        if let Some(proxy) = part.strip_prefix(ty) {
+                            let proxy = proxy.trim();
+                            let colon = proxy.find(':').ok_or_else(|| {
+                                Error::MalformedProxyEntry("No colon in entry".into())
+                            })?;
+                            let (host, port) = proxy.trim().split_at(colon);
+                            return Ok(ProxyEntry::Proxied {
+                                ty: ty.parse()?,
+                                host: host.into(),
+                                port: port[1..].into(),
+                            });
+                        }
+                    }
+                    Err(Error::MalformedProxyEntry("No type matched".into()))
+                }
+            })
+            .collect()
+    }
+}
+
+impl<'ctx> Drop for PacFile<'ctx> {
+    fn drop(&mut self) {
+        if let Err(e) = self.ctx.js_ctx.eval("pac = undefined;") {
+            log::warn!("Could not erease pac function: {:?}", e);
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{decode_proxy, PacParser, ProxyEntry, ProxyType};
-    use serial_test::serial;
     use url::Url;
 
-    macro_rules! PAC_FILE {
-        ($path:literal) => {
-            pub static PAC_TEST_FILE: &str = include_str!(concat!("../", $path));
-            pub static PAC_TEST_FILE_PATH: &str = $path;
+    use crate::{PacParser, ProxyEntry, ProxyType};
+
+    macro_rules! pac {
+        ($code:literal) => {
+            concat!("function FindProxyForURL(url, host) { ", $code, " } ")
+        };
+        ($code:literal, $($tt:tt)*) => {{
+            let code = format!($code, $($tt)*);
+            format!("function FindProxyForURL(url, host) {{ {} }} ", code)
+        }};
+    }
+
+    macro_rules! define_pac {
+        ($name:ident, $code:literal) => {
+            static $name: &str = pac!($code);
         };
     }
 
-    PAC_FILE! {"pacparser-sys/src/pacparser/tests/proxy.pac"}
+    define_pac! {DIRECT, r#"return "DIRECT";"#}
+    define_pac! {SIMPLE, r#"return "PROXY 127.0.0.1:8118; DIRECT";"#}
 
     #[test]
-    fn proxy_entry() {
-        assert_eq!(
-            decode_proxy("PROXY 165.225.77.222:80; PROXY 165.225.204.40:80; DIRECT").unwrap(),
-            vec![
-                ProxyEntry::Proxied {
-                    ty: ProxyType::Proxy,
-                    host: "165.225.77.222".into(),
-                    port: "80".into(),
-                },
-                ProxyEntry::Proxied {
-                    ty: ProxyType::Proxy,
-                    host: "165.225.204.40".into(),
-                    port: "80".into(),
-                },
-                ProxyEntry::Direct,
-            ]
-        )
-    }
-
-    #[test]
-    #[serial]
     fn init_fini() {
         PacParser::new().unwrap();
     }
 
     #[test]
-    #[serial]
-    fn load_test_string() {
-        let mut lib = PacParser::new().unwrap();
-        lib.load_string(PAC_TEST_FILE).unwrap();
+    fn load_direct() {
+        let mut parser = PacParser::new().unwrap();
+        parser.load(DIRECT).unwrap();
     }
 
     #[test]
-    #[serial]
-    fn load_test_path() {
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut lib = PacParser::new().unwrap();
-        lib.load_path(workspace.join(PAC_TEST_FILE_PATH)).unwrap();
+    fn load_simple() {
+        let mut parser = PacParser::new().unwrap();
+        parser.load(SIMPLE).unwrap();
     }
 
     #[test]
-    #[serial]
-    fn with_default_ip() {
-        macro_rules! assert_url {
-            ($pac:expr, $url:literal, $proxy:literal) => {
-                let url = Url::parse($url).unwrap();
+    fn run_direct() {
+        let mut parser = PacParser::new().unwrap();
+        let mut pac = parser.load(DIRECT).unwrap();
+        let proxy = pac
+            .find_proxy(&Url::parse("http://localhost").unwrap())
+            .unwrap();
 
-                assert_eq!(
-                    $pac.find_proxy(url.as_str(), url.host_str().unwrap())
-                        .unwrap(),
-                    $proxy,
-                )
-            };
-        }
-
-        let mut lib = PacParser::new().unwrap();
-        let mut pac = lib.load_string(PAC_TEST_FILE).unwrap();
-
-        assert_url!(pac, "http://host1", "plainhost/.manugarg.com");
-        assert_url!(pac, "http://www1.manugarg.com", "plainhost/.manugarg.com");
-        assert_url!(pac, "http://www.manugarg.org/test'o'rama", "URLHasQuotes");
-        assert_url!(pac, "http://manugarg.externaldomain.com", "externaldomain");
-        // Internet Required
-        assert_url!(pac, "http://www.google.com", "isResolvable");
-        assert_url!(pac, "https://www.somehost.com", "secureUrl");
-        /*
-        return END OF SCRIPT ??
-        assert_url!(
-            pac,
-            "http://www.notresolvabledomainXXX.com",
-            "isNotResolvable"
-        ); */
+        assert_eq!(proxy, vec![ProxyEntry::Direct]);
     }
 
     #[test]
-    #[serial]
-    fn with_changed_ip() {
-        macro_rules! assert_url {
-            ($pac:expr, $ip:literal, $url:literal, $proxy:literal) => {
-                $pac.set_ip($ip).unwrap();
-                let url = Url::parse($url).unwrap();
+    fn run_simple() {
+        let mut parser = PacParser::new().unwrap();
+        let mut pac = parser.load(SIMPLE).unwrap();
+        let proxy = pac
+            .find_proxy(&Url::parse("http://localhost").unwrap())
+            .unwrap();
 
-                assert_eq!(
-                    $pac.find_proxy(url.as_str(), url.host_str().unwrap())
-                        .unwrap(),
-                    $proxy,
-                )
-            };
-        }
-
-        let mut lib = PacParser::new().unwrap();
-        let mut pac = lib.load_string(PAC_TEST_FILE).unwrap();
-
-        assert_url!(
-            pac,
-            "3ffe:8311:ffff:1:0:0:0:0",
-            "http://www.somehost.com",
-            "3ffe:8311:ffff"
+        assert_eq!(
+            proxy,
+            vec![
+                ProxyEntry::Proxied {
+                    ty: ProxyType::Proxy,
+                    host: "127.0.0.1".into(),
+                    port: "8118".into(),
+                },
+                ProxyEntry::Direct
+            ]
         );
-        assert_url!(pac, "0.0.0.0", "http://www.google.co.in", "END-OF-SCRIPT");
-        assert_url!(pac, "10.10.100.112", "http://www.somehost.com", "10.10.0.0");
+    }
+
+    macro_rules! define_pac_test {
+        ($name:ident, $condition:literal, $input:literal) => {
+            #[test]
+            fn $name() {
+                let mut parser = PacParser::new().unwrap();
+                let pac = pac!(
+                    r#"
+                    if ({})
+                        return "PROXY 1:80";
+                    return "DIRECT""#,
+                    $condition
+                );
+                let mut pac = parser.load(pac).unwrap();
+
+                let proxy = pac.find_proxy(&Url::parse($input).unwrap()).unwrap();
+
+                assert_eq!(
+                    proxy,
+                    vec![ProxyEntry::Proxied {
+                        ty: ProxyType::Proxy,
+                        host: "1".into(),
+                        port: "80".into()
+                    }]
+                );
+            }
+        };
+    }
+
+    define_pac_test! {
+        dns_domain,
+        r#"dnsDomainIs(host, "intranet.domain.com")"#,
+        "http://intranet.domain.com"
+    }
+
+    define_pac_test! {
+        sh_expr_exact,
+        r#"shExpMatch(host, "(.*.adcdom.com|abcdom.com)")"#,
+        "http://abcdom.com"
+    }
+
+    define_pac_test! {
+        sh_expr_repeat,
+        r#"shExpMatch(host, "(.*.abcdom.com|abcdom.com)")"#,
+        "http://foo.abcdom.com"
+    }
+
+    define_pac_test! {
+        substring,
+        r#"url.substring(0, 4) == "ftp:""#,
+        "ftp://thing.please"
+    }
+
+    define_pac_test! {
+        is_in_net,
+        r#"isInNet(host, "127.0.0.0", "255.0.0.0")"#,
+        "http://localhost"
+    }
+
+    define_pac_test! {
+        is_in_net_resolve,
+        r#"isInNet(dnsResolve(host), "127.0.0.0", "255.0.0.0")"#,
+        "http://localhost"
+    }
+
+    define_pac_test! {
+        my_ip,
+        r#"isInNet(myIpAddress(), "192.168.0.0", "255.255.0.0")"#,
+        "http://localhost"
+    }
+
+    define_pac_test! {
+        host_or_domain_exact,
+        r#"localHostOrDomainIs(host, "www.mozilla.org")"#,
+        "http://www.mozilla.org"
+    }
+
+    define_pac_test! {
+        host_or_domain_prefix,
+        r#"localHostOrDomainIs(host, "www.mozilla.org")"#,
+        "http://www"
     }
 }

@@ -1,3 +1,0 @@
-[submodule "pacparser-sys/src/pacparser"]
-	path = pacparser-sys/src/pacparser
-	url = https://github.com/manugarg/pacparser
